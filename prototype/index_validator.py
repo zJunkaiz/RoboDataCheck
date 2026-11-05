@@ -11,12 +11,21 @@ def finite_numeric(value):
     return type(value) in (int, float) and isfinite(value)
 
 
+def has_shape(value, shape):
+    if not shape:
+        return not isinstance(value, list)
+    return isinstance(value, list) and len(value) == shape[0] and all(
+        has_shape(item, shape[1:]) for item in value
+    )
+
+
 def validate_episode(episode, batches, fps, features, tolerance=1e-4):
     episode_id = episode["episode_index"]
     start = episode["dataset_from_index"]
     frame_count = 0
     previous_timestamp = None
     first = last = None
+    action_min = action_max = None
     for batch in batches:
         columns = batch.data
         for offset, timestamp in enumerate(columns["timestamp"]):
@@ -51,11 +60,31 @@ def validate_episode(episode, batches, fps, features, tolerance=1e-4):
                 raise InspectionError(
                     "TIMESTAMP_ERROR", f"{location}: timestamp differs from frame_index/FPS"
                 )
-            for feature in features:
-                if not finite_numeric(columns[feature][offset]):
+            for feature, spec in features.items():
+                value = columns[feature][offset]
+                if not finite_numeric(value):
                     raise InspectionError(
                         "NUMERIC_ERROR", f"{location}: {feature} contains a missing or non-finite value"
                     )
+                shape = spec.get("shape")
+                if shape is not None and not (
+                    has_shape(value, shape) or (shape == [1] and not isinstance(value, list))
+                ):
+                    raise InspectionError(
+                        "FEATURE_SCHEMA_ERROR", f"{location}: {feature} expected shape {shape}"
+                    )
+                if feature == "action":
+                    vector = value if isinstance(value, list) else [value]
+                    if all(type(item) in (int, float) for item in vector):
+                        if action_min is None:
+                            action_min, action_max = vector.copy(), vector.copy()
+                        if len(vector) != len(action_min):
+                            raise InspectionError(
+                                "FEATURE_SCHEMA_ERROR", f"{location}: inconsistent action dimensions"
+                            )
+                        for dimension, item in enumerate(vector):
+                            action_min[dimension] = min(action_min[dimension], item)
+                            action_max[dimension] = max(action_max[dimension], item)
             last = {"view_row_index": view_row, "index": index, "frame_index": frame,
                     "timestamp": timestamp}
             if first is None:
@@ -68,4 +97,13 @@ def validate_episode(episode, batches, fps, features, tolerance=1e-4):
             "FRAME_INDEX_ERROR",
             f"Episode {episode_id}: expected {episode['length']} frames, found {frame_count}",
         )
-    return {"frames": frame_count, "first_frame": first, "last_frame": last}
+    result = {"frames": frame_count, "first_frame": first, "last_frame": last}
+    if action_min is not None:
+        result["action_statistics"] = {
+            "min": action_min,
+            "max": action_max,
+            "constant_dimensions": [
+                i for i, (low, high) in enumerate(zip(action_min, action_max)) if low == high
+            ],
+        }
+    return result

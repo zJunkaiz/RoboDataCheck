@@ -11,7 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from prototype.metadata_reader import InspectionError
-from prototype.run_prototype import inspect, main
+from prototype.run_prototype import inspect, inspect_dataset, main
 
 
 class PrototypeTests(unittest.TestCase):
@@ -28,7 +28,8 @@ class PrototypeTests(unittest.TestCase):
             "total_frames": 5,
             "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
             "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
-            "features": {"action": {"dtype": "float32"}, "observation.state": {"dtype": "float32"},
+            "features": {"action": {"dtype": "float32", "shape": [1]},
+                         "observation.state": {"dtype": "float32", "shape": [1]},
                          "observation.images.front": {"dtype": "video"}},
         }
         meta = self.root / "meta/episodes/chunk-000/file-000.parquet"
@@ -52,8 +53,8 @@ class PrototypeTests(unittest.TestCase):
             "index": [0, 1, 2, 3, 4],
             "frame_index": [0, 1, 0, 1, 2],
             "timestamp": timestamps or [0.0, 0.1, 0.0, 0.1, 0.2],
-            "action": actions or [[0.0]] * 5,
-            "observation.state": [[1.0]] * 5,
+            "action": pa.array(actions or [[0.0]] * 5, type=pa.list_(pa.float32())),
+            "observation.state": pa.array([[1.0]] * 5, type=pa.list_(pa.float32())),
         }), self.shard)
 
     def test_info_reads_metadata_without_data_shard(self):
@@ -104,3 +105,33 @@ class PrototypeTests(unittest.TestCase):
         with self.assertRaisesRegex(InspectionError, "view row 2: action") as error:
             inspect(self.root, 1, 2, 1e-4)
         self.assertEqual(error.exception.code, "NUMERIC_ERROR")
+
+    def test_wrong_action_shape_fails(self):
+        self.write_frames(actions=[[0.0, 1.0]] * 5)
+        with self.assertRaises(InspectionError) as error:
+            inspect(self.root, 1, 2, 1e-4)
+        self.assertEqual(error.exception.code, "FEATURE_SCHEMA_ERROR")
+
+    def test_full_scan_continues_after_episode_failure_and_writes_reports(self):
+        self.write_frames(actions=[[float("nan")]] + [[0.0]] * 4)
+        output = self.root / "reports"
+        with contextlib.redirect_stdout(io.StringIO()):
+            status = main(["inspect", str(self.root), "--json", "--output", str(output)],
+                          default_episode=None)
+        self.assertEqual(status, 1)
+        report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["failed_episodes"], 1)
+        self.assertEqual(report["passed_episodes"], 1)
+        self.assertEqual(report["episodes"][0]["code"], "NUMERIC_ERROR")
+        self.assertEqual(report["episodes"][1]["action_statistics"]["constant_dimensions"], [0])
+        self.assertIn("NUMERIC_ERROR", (output / "report.html").read_text(encoding="utf-8"))
+
+    def test_full_scan_detects_unclaimed_shard_row(self):
+        table = pq.read_table(self.shard)
+        orphan = pa.Table.from_pylist([dict(table.to_pylist()[0], episode_index=9, index=99)],
+                                     schema=table.schema)
+        pq.write_table(pa.concat_tables([table, orphan]), self.shard)
+        report = inspect_dataset(self.root, 2, 1e-4)
+        self.assertEqual(report["passed_episodes"], 2)
+        self.assertEqual(report["status"], "ERROR")
+        self.assertEqual(report["issues"][0]["code"], "SHARD_FRAME_COUNT_ERROR")

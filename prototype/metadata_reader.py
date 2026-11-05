@@ -37,6 +37,10 @@ def read_info(root: Path) -> dict:
     features = info.get("features")
     if not isinstance(features, dict) or any(
         not isinstance(spec, dict) or not isinstance(spec.get("dtype"), str)
+        or ("shape" in spec and (
+            not isinstance(spec["shape"], list)
+            or any(type(size) is not int or size <= 0 for size in spec["shape"])
+        ))
         for spec in features.values()
     ):
         raise InspectionError("METADATA_READ_ERROR", f"{path}: invalid features")

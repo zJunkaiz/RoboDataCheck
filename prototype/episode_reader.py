@@ -23,7 +23,7 @@ class FrameBatch:
     data: dict
 
 
-def read_episode(root, episode_index):
+def read_episodes(root, episode_index=None):
     directory = root / "meta/episodes"
     shards = sorted(directory.glob("chunk-*/file-*.parquet"))
     if not shards:
@@ -42,19 +42,26 @@ def read_episode(root, episode_index):
                     name for name in parquet.schema_arrow.names
                     if name in EPISODE_COLUMNS or name.startswith("videos/")
                 ]
-            table = pq.read_table(
-                shard, columns=columns, filters=[("episode_index", "=", episode_index)]
-            )
+            filters = None if episode_index is None else [("episode_index", "=", episode_index)]
+            table = pq.read_table(shard, columns=columns, filters=filters)
             matches.extend(table.to_pylist())
         except (OSError, pa.ArrowException) as error:
             raise InspectionError("METADATA_READ_ERROR", f"{shard}: {error}") from error
 
+    return matches
+
+
+def read_episode(root, episode_index):
+    matches = read_episodes(root, episode_index)
     if len(matches) != 1:
         raise InspectionError(
             "EPISODE_INDEX_MISMATCH",
             f"Expected one metadata record for Episode {episode_index}, found {len(matches)}",
         )
-    episode = matches[0]
+    return validate_episode_metadata(matches[0])
+
+
+def validate_episode_metadata(episode):
     start, end, length = (
         episode["dataset_from_index"], episode["dataset_to_index"], episode["length"]
     )
@@ -64,18 +71,23 @@ def read_episode(root, episode_index):
         or end - start != length
     ):
         raise InspectionError(
-            "EPISODE_INDEX_MISMATCH", f"Episode {episode_index}: invalid index range or length"
+            "EPISODE_INDEX_MISMATCH", f"Episode {episode['episode_index']!r}: invalid index range or length"
         )
     return episode
 
 
-def iter_frame_batches(root, info, episode, features, batch_size):
+def data_path(root, info, episode):
     path = shard_path(
         root, info.get("data_path"),
         chunk_index=episode["data/chunk_index"], file_index=episode["data/file_index"],
     )
     if not path.is_file():
         raise InspectionError("MISSING_DATA_SHARD", str(path))
+    return path
+
+
+def iter_frame_batches(root, info, episode, features, batch_size):
+    path = data_path(root, info, episode)
 
     episode_index = episode["episode_index"]
     # Include rows claimed by either identifier so contradictory IDs remain visible.
@@ -88,6 +100,16 @@ def iter_frame_batches(root, info, episode, features, batch_size):
         missing = set(columns) - set(table.schema.names)
         if missing:
             raise InspectionError("DATA_READ_ERROR", f"{path}: missing columns {sorted(missing)}")
+        for name, spec in features.items():
+            dtype = table.schema.field(name).type
+            while pa.types.is_list(dtype) or pa.types.is_large_list(dtype) or pa.types.is_fixed_size_list(dtype):
+                dtype = dtype.value_type
+            if str(dtype) != {"float32": "float", "float64": "double", "float16": "halffloat"}.get(
+                spec["dtype"], spec["dtype"]
+            ):
+                raise InspectionError(
+                    "FEATURE_SCHEMA_ERROR", f"{path}: {name} declares {spec['dtype']}, found {dtype}"
+                )
         view_row = 0
         for batch in table.to_batches(
             columns=columns, filter=selected, batch_size=batch_size, use_threads=False
@@ -113,3 +135,40 @@ def video_availability(root, info, episode):
         ).is_file():
             return "MISSING"
     return "PRESENT"
+
+
+class LeRobotV3Adapter:
+    """Local LeRobot storage access used by the inspection engine."""
+
+    def __init__(self, root, info):
+        self.root = root
+        self.info = info
+
+    def episodes(self, episode_index=None):
+        if episode_index is not None:
+            return [read_episode(self.root, episode_index)]
+        if self.info["total_episodes"] == 0 and not (self.root / "meta/episodes").exists():
+            return []
+        return read_episodes(self.root)
+
+    def batches(self, episode, features, batch_size):
+        return iter_frame_batches(self.root, self.info, episode, features, batch_size)
+
+    def video_availability(self, episode):
+        return video_availability(self.root, self.info, episode)
+
+    def data_path(self, episode):
+        return data_path(self.root, self.info, episode)
+
+    def shard_issues(self, expected_counts):
+        paths = {path.resolve() for path in (self.root / "data").glob("chunk-*/file-*.parquet")}
+        for path in sorted(paths - expected_counts.keys()):
+            yield ("UNREFERENCED_DATA_SHARD", str(path))
+        for path, expected in sorted(expected_counts.items()):
+            try:
+                actual = pq.read_metadata(path).num_rows
+            except (OSError, pa.ArrowException) as error:
+                yield ("DATA_READ_ERROR", f"{path}: {error}")
+                continue
+            if actual != expected:
+                yield ("SHARD_FRAME_COUNT_ERROR", f"{path}: expected {expected} rows, found {actual}")
